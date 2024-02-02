@@ -1,5 +1,6 @@
 ﻿using Discord;
 using Discord.WebSocket;
+using HuntShowdownBot.Types;
 using System.Xml;
 
 public class Program
@@ -9,16 +10,16 @@ public class Program
     private DiscordSocketClient _client;
     private ulong _guildId = 1198618069052948561;
 
-    private string dir = "D:\\SteamLibrary\\steamapps\\common\\Hunt Showdown\\user\\profiles\\default\\attributes.xml";
- 
-
-
     public async Task MainAsync()
     {
-        var token = Environment.GetEnvironmentVariable("TokenHuntBot",EnvironmentVariableTarget.User);      
+        var token = Environment.GetEnvironmentVariable("DiscordToken", EnvironmentVariableTarget.User);
 
-        
-        _client = new DiscordSocketClient();
+        var options = new DiscordSocketConfig()
+        {
+            UseInteractionSnowflakeDate = false
+        };
+
+        _client = new DiscordSocketClient(options);
         _client.Log += Log;
 
         await _client.LoginAsync(TokenType.Bot, token);
@@ -35,17 +36,61 @@ public class Program
     {
         var guild = _client.GetGuild(_guildId);
 
-        var guildCommand = new SlashCommandBuilder();
-        guildCommand.WithName("mmr");
-        guildCommand.WithDescription("Command to retrieve your MMR.");
-
+        var guildCommand = new SlashCommandBuilder()
+        .WithName("mmr")
+        .WithDescription("Command to retrieve your MMR.")
+        .AddOption("file", ApplicationCommandOptionType.Attachment, "The file to parse.", true);
 
         await guild.CreateApplicationCommandAsync(guildCommand.Build());
     }
 
     private async Task SlashCommandExecuted(SocketSlashCommand command)
     {
-        await command.RespondAsync(XmlParse());
+        var option = command.Data.Options.First(o => o.Type == ApplicationCommandOptionType.Attachment).Value as Attachment; // I'm not checking for nulls here, you should!
+
+        string url = option.Url;
+        var xml = await GetFileAttachment(url);
+
+        HuntMatch huntMatch;
+        try
+        {
+            huntMatch = XmlParse(xml);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"O filho da puta \"{command.User.Username}\" mandou um arquivo nada a vê");
+
+            var resposta = new EmbedBuilder()
+                .WithTitle("Invalid File")
+                .WithDescription("FILHO DA PUTA, MANDA O BAGULHO DIREITO")
+                .WithColor(255, 0, 0);
+
+            await command.RespondAsync(embed: resposta.Build(), ephemeral: true);
+            return;
+        }
+
+        var embed = new EmbedBuilder()
+            .WithTitle("Team MMR")
+            .WithFooter("This show the MMR of each player in the team.")
+            .WithColor(255, 0, 0);
+
+        foreach (var team in huntMatch.Teams)
+        {
+            embed.AddField($"Team {team.Id + 1}", $"`{team.MMR}`", true);
+            embed.AddField($"Players", $"`{string.Join("\n", team.Players.Select(player => $"{player.Name}"))}`", true);
+            embed.AddField($"MMR", $"`{string.Join("\n", team.Players.Select(player => $"{player.MMR}"))}`", true);
+            embed.AddField("** **", "** **", false);
+        }
+
+        await command.RespondAsync(embed: embed.Build(), ephemeral: true);
+
+        async Task<string> GetFileAttachment(string url)
+        {
+            var httpClient = new HttpClient();
+            var responseStream = await httpClient.GetStreamAsync(url);
+            using var reader = new StreamReader(responseStream);
+            return reader.ReadToEnd();
+        }
     }
 
     private Task Log(LogMessage msg)
@@ -54,30 +99,34 @@ public class Program
         return Task.CompletedTask;
     }
 
-    private string XmlParse()
+    private HuntMatch XmlParse(string xml)
     {
-        string output = "";
-
         XmlDocument doc = new XmlDocument();
-        doc.Load(dir);
+        doc.LoadXml(xml);
 
-        XmlNode mainNode = doc.SelectSingleNode("Attributes");
-        XmlNodeList players = mainNode.SelectNodes("//Attr[starts-with(@name, \"MissionBagPlayer\") and contains(@name, \"blood_line_name\")]");
-        XmlNodeList mmrs = mainNode.SelectNodes("//Attr[starts-with(@name, \"MissionBagPlayer\") and contains(@name, \"mmr\")]");
+        XmlNode mainNode = doc.SelectSingleNode("Attributes")!;
 
+        int numberOfTeams = int.Parse(mainNode.SelectSingleNode("//Attr[@name=\"MissionBagNumTeams\"]")!.Attributes!["value"]!.Value);
 
-        foreach (XmlNode node in players)
+        var teams = new List<HuntTeam>();
+        for (int i = 0; i < numberOfTeams; i++)
         {
-            string teamPlayerIds = node.Attributes["name"].Value.Substring(17, 3);
-            XmlNode mmr = mmrs.Cast<XmlNode>().Where(m => m.Attributes["name"].Value.Substring(17,3) == teamPlayerIds).FirstOrDefault();
-            string teamId = teamPlayerIds.Substring(0, 1);
-            
-           
+            int numberOfPlayers = int.Parse(mainNode.SelectSingleNode($"//Attr[@name=\"MissionBagTeam_{i}_numplayers\"]")!.Attributes!["value"]!.Value);
+            int teamMMR = int.Parse(mainNode.SelectSingleNode($"//Attr[@name=\"MissionBagTeam_{i}_mmr\"]")!.Attributes!["value"]!.Value);
 
-            output += $"Team:{teamId} {node.Attributes["value"].Value} {mmr.Attributes["value"].Value} {Environment.NewLine}";
+            var players = new List<HuntPlayer>();
+            for (int j = 0; j < numberOfPlayers; j++)
+            {
+                var playerId = long.Parse(mainNode.SelectSingleNode($"//Attr[@name=\"MissionBagPlayer_{i}_{j}_profileid\"]")!.Attributes!["value"]!.Value);
+                var playerName = mainNode.SelectSingleNode($"//Attr[@name=\"MissionBagPlayer_{i}_{j}_blood_line_name\"]")!.Attributes!["value"]!.Value;
+                var playerMMR = int.Parse(mainNode.SelectSingleNode($"//Attr[@name=\"MissionBagPlayer_{i}_{j}_mmr\"]")!.Attributes!["value"]!.Value);
+
+                players.Add(new HuntPlayer(playerId, playerName, playerMMR));
+            }
+
+            teams.Add(new HuntTeam(i, players, teamMMR));
         }
-        return output;
-    }
-    
 
+        return new HuntMatch(teams);
+    }
 }
